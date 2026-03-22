@@ -1,0 +1,12 @@
+{
+  "name": "feishu",
+  "description": "Feishu (飞书/Lark) channel for Claude Code — messaging bridge with built-in access control. Manage pairing, allowlists, and policy via /feishu:access.",
+  "version": "0.0.1",
+  "keywords": [
+    "feishu",
+    "lark",
+    "messaging",
+    "channel",
+    "mcp"
+  ]
+}
