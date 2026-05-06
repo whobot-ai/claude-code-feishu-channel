@@ -242,6 +242,10 @@ interface InboundMessage {
     name: string
   }>
   createTime: string
+  /** parent_id from Feishu — set when this message is a quote-reply to another message. */
+  parentId?: string
+  /** root_id from Feishu — set when the parent itself is part of a thread. */
+  rootId?: string
 }
 
 // Track message IDs we recently sent, so reply-to-bot in group chats
@@ -526,6 +530,137 @@ async function replyTextMessage(messageId: string, text: string): Promise<string
   return msgId
 }
 
+// ── Interactive card builder ─────────────────────────────────────────────────
+
+type CardSeverity = 'success' | 'warning' | 'error' | 'info'
+type CardTemplate =
+  | 'blue' | 'green' | 'red' | 'orange' | 'turquoise' | 'purple'
+  | 'wathet' | 'yellow' | 'grey' | 'carmine' | 'violet' | 'indigo'
+
+interface CardField {
+  label: string
+  value: string
+  short?: boolean
+}
+
+type CardSection =
+  | { type: 'markdown'; text: string }
+  | { type: 'fields'; fields: CardField[] }
+  | { type: 'divider' }
+  | { type: 'note'; text: string }
+
+interface SimpleCard {
+  fallback_text: string
+  header: {
+    title: string
+    subtitle?: string
+    severity?: CardSeverity
+    template?: CardTemplate
+  }
+  sections: CardSection[]
+}
+
+const SEVERITY_TO_TEMPLATE: Record<CardSeverity, CardTemplate> = {
+  success: 'green',
+  warning: 'orange',
+  error: 'red',
+  info: 'blue',
+}
+
+const VALID_TEMPLATES: ReadonlySet<string> = new Set([
+  'blue', 'green', 'red', 'orange', 'turquoise', 'purple',
+  'wathet', 'yellow', 'grey', 'carmine', 'violet', 'indigo',
+])
+
+function buildCardContent(input: SimpleCard): string {
+  if (!input.header || typeof input.header.title !== 'string' || !input.header.title) {
+    throw new Error('reply_card: header.title is required')
+  }
+  if (!Array.isArray(input.sections) || input.sections.length === 0) {
+    throw new Error('reply_card: at least one section is required')
+  }
+  if (typeof input.fallback_text !== 'string' || !input.fallback_text) {
+    throw new Error('reply_card: fallback_text is required')
+  }
+
+  const template: CardTemplate =
+    (input.header.template && VALID_TEMPLATES.has(input.header.template)
+      ? input.header.template
+      : input.header.severity
+        ? SEVERITY_TO_TEMPLATE[input.header.severity]
+        : 'blue')
+
+  const elements: unknown[] = []
+  for (const s of input.sections) {
+    if (s.type === 'markdown') {
+      if (typeof s.text !== 'string' || !s.text) continue
+      elements.push({ tag: 'markdown', content: s.text })
+    } else if (s.type === 'divider') {
+      elements.push({ tag: 'hr' })
+    } else if (s.type === 'note') {
+      if (typeof s.text !== 'string' || !s.text) continue
+      elements.push({
+        tag: 'note',
+        elements: [{ tag: 'plain_text', content: s.text }],
+      })
+    } else if (s.type === 'fields') {
+      if (!Array.isArray(s.fields) || s.fields.length === 0) continue
+      elements.push({
+        tag: 'div',
+        fields: s.fields.map((f) => ({
+          is_short: f.short ?? true,
+          text: {
+            tag: 'lark_md',
+            content: `**${f.label}**\n${f.value}`,
+          },
+        })),
+      })
+    }
+  }
+
+  const header: Record<string, unknown> = {
+    title: { tag: 'plain_text', content: input.header.title },
+    template,
+  }
+  if (input.header.subtitle) {
+    header.subtitle = { tag: 'plain_text', content: input.header.subtitle }
+  }
+
+  return JSON.stringify({
+    config: { wide_screen_mode: true },
+    summary: { content: input.fallback_text },
+    header,
+    elements,
+  })
+}
+
+async function sendCardMessage(chatId: string, content: string): Promise<string> {
+  const resp = await feishuClient.im.message.create({
+    params: { receive_id_type: 'chat_id' },
+    data: {
+      receive_id: chatId,
+      msg_type: 'interactive',
+      content,
+    },
+  })
+  const msgId = resp?.data?.message_id ?? resp?.message_id ?? ''
+  if (msgId) noteSent(msgId)
+  return msgId
+}
+
+async function replyCardMessage(messageId: string, content: string): Promise<string> {
+  const resp = await feishuClient.im.message.reply({
+    path: { message_id: messageId },
+    data: {
+      msg_type: 'interactive',
+      content,
+    },
+  })
+  const msgId = resp?.data?.message_id ?? resp?.message_id ?? ''
+  if (msgId) noteSent(msgId)
+  return msgId
+}
+
 async function uploadAndSendFile(
   chatId: string,
   filePath: string,
@@ -604,7 +739,12 @@ const mcp = new Server(
       'The Feishu sender cannot see your terminal output — only what you send via the reply tool reaches them.',
       '',
       'If the tag has attachment_count, the attachments attribute lists name/type/size — call download_attachment(chat_id, message_id) to fetch them.',
+      'If the tag has reply_to_id, the user is quote-replying to an earlier message — reply_to_text contains that message\'s content (truncated to ~1000 chars), reply_to_user is its sender open_id, and reply_to_attachments lists any attachments on it. Treat reply_to_text as context the user wants you to see; use fetch_messages only if you need more than the snippet.',
       'Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
+      '',
+      'Two reply tools — pick based on content shape:',
+      '  • reply (default) — plain text. Use for conversation, clarifying questions, single-sentence answers, code-heavy output, and anything that fits naturally as a paragraph.',
+      '  • reply_card — Feishu interactive card with a colored header + structured sections. Use when the response benefits from visual structure: build/PR/QA/lint result summaries, status reports with multiple distinct sections, success/warning/error notifications, or tabular field/value data. Pass severity ("success"|"warning"|"error"|"info") to auto-color the header (green/orange/red/blue); only set template directly when you need a specific color outside that set. Always include fallback_text for the notification preview. DO NOT use cards for short replies, single-sentence answers, or pure code blocks — text is better there. Card buttons/forms are not supported in this plugin (no callback endpoint).',
       '',
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments — images and files are uploaded to Feishu automatically.',
       'Use react to add emoji reactions (Feishu emoji_type like THUMBSUP, SMILE, OK, etc.).',
@@ -645,6 +785,120 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
         },
         required: ['chat_id', 'text'],
+      },
+    },
+    {
+      name: 'reply_card',
+      description: [
+        'Reply on Feishu with an interactive card (colored header + structured sections).',
+        'Use when the response benefits from visual structure: build/PR/QA/lint summaries, status reports with multiple sections, success/warning/error notifications, or labeled field/value data.',
+        'Do NOT use for short replies, single-sentence answers, or pure code blocks — use the plain "reply" tool there.',
+        'Pass severity ("success"|"warning"|"error"|"info") to auto-color the header (green/orange/red/blue); set template explicitly only for colors outside that set.',
+        'fallback_text is required (used for notification preview and clients that cannot render cards).',
+        'Buttons/forms are NOT supported (this plugin has no card.action callback endpoint).',
+      ].join(' '),
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string' },
+          reply_to: {
+            type: 'string',
+            description:
+              'Message ID to reply to (quote-reply threading). Use message_id from the inbound <channel> block, or an id from fetch_messages.',
+          },
+          fallback_text: {
+            type: 'string',
+            description:
+              'Plain-text summary used for notification previews and old clients that cannot render cards. Keep it short (one line).',
+          },
+          header: {
+            type: 'object',
+            properties: {
+              title: { type: 'string' },
+              subtitle: { type: 'string' },
+              severity: {
+                type: 'string',
+                enum: ['success', 'warning', 'error', 'info'],
+                description:
+                  'Convenience: success→green, warning→orange, error→red, info→blue. Overridden by explicit template.',
+              },
+              template: {
+                type: 'string',
+                enum: [
+                  'blue', 'green', 'red', 'orange', 'turquoise', 'purple',
+                  'wathet', 'yellow', 'grey', 'carmine', 'violet', 'indigo',
+                ],
+                description:
+                  'Header color. Takes precedence over severity. If neither is set, defaults to blue.',
+              },
+            },
+            required: ['title'],
+          },
+          sections: {
+            type: 'array',
+            minItems: 1,
+            description:
+              'Ordered list of card body sections. Common pattern: markdown intro → fields summary → divider → note footer.',
+            items: {
+              oneOf: [
+                {
+                  type: 'object',
+                  properties: {
+                    type: { const: 'markdown' },
+                    text: {
+                      type: 'string',
+                      description:
+                        'Feishu lark_md markdown. Supports **bold**, *italic*, `code`, [link](url), and code fences. No headings (use card header instead).',
+                    },
+                  },
+                  required: ['type', 'text'],
+                },
+                {
+                  type: 'object',
+                  properties: {
+                    type: { const: 'fields' },
+                    fields: {
+                      type: 'array',
+                      minItems: 1,
+                      items: {
+                        type: 'object',
+                        properties: {
+                          label: { type: 'string' },
+                          value: { type: 'string' },
+                          short: {
+                            type: 'boolean',
+                            description:
+                              'true (default) = half-width side-by-side; false = full-width stacked.',
+                          },
+                        },
+                        required: ['label', 'value'],
+                      },
+                    },
+                  },
+                  required: ['type', 'fields'],
+                },
+                {
+                  type: 'object',
+                  properties: { type: { const: 'divider' } },
+                  required: ['type'],
+                },
+                {
+                  type: 'object',
+                  properties: {
+                    type: { const: 'note' },
+                    text: {
+                      type: 'string',
+                      description:
+                        'Small grey footnote text (e.g. timestamps, source attribution).',
+                    },
+                  },
+                  required: ['type', 'text'],
+                },
+              ],
+            },
+          },
+        },
+        required: ['chat_id', 'fallback_text', 'header', 'sections'],
       },
     },
     {
@@ -775,6 +1029,25 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           parts.push(`attachments: ${fileResults.join('; ')}`)
         }
         return { content: [{ type: 'text', text: parts.join(' | ') }] }
+      }
+
+      case 'reply_card': {
+        const chatId = args.chat_id as string
+        const replyTo = args.reply_to as string | undefined
+        const card: SimpleCard = {
+          fallback_text: args.fallback_text as string,
+          header: args.header as SimpleCard['header'],
+          sections: args.sections as CardSection[],
+        }
+
+        const content = buildCardContent(card)
+        const msgId = replyTo
+          ? await replyCardMessage(replyTo, content)
+          : await sendCardMessage(chatId, content)
+
+        return {
+          content: [{ type: 'text', text: `card sent (id: ${msgId})` }],
+        }
       }
 
       case 'fetch_messages': {
@@ -989,6 +1262,10 @@ async function handleInbound(msg: InboundMessage): Promise<void> {
 
   const content = text || (atts.count > 0 ? '(attachment)' : '')
 
+  // If this is a quote-reply, fetch the parent message so the model can see
+  // what the user is referring to without an extra fetch_messages roundtrip.
+  const replyMeta = await fetchReplyContext(msg.parentId)
+
   mcp
     .notification({
       method: 'notifications/claude/channel',
@@ -1007,6 +1284,7 @@ async function handleInbound(msg: InboundMessage): Promise<void> {
                 attachments: atts.descriptions.join('; '),
               }
             : {}),
+          ...replyMeta,
         },
       },
     })
@@ -1015,6 +1293,63 @@ async function handleInbound(msg: InboundMessage): Promise<void> {
         `feishu channel: failed to deliver inbound to Claude: ${err}\n`,
       )
     })
+}
+
+/**
+ * Fetch the message being quote-replied to and return meta fields describing it.
+ * Returns an empty object on any failure — the channel block still goes through,
+ * just without the reply_to_* fields.
+ */
+async function fetchReplyContext(parentId?: string): Promise<Record<string, string>> {
+  if (!parentId) return {}
+  try {
+    const resp: any = await feishuClient.im.message.get({
+      path: { message_id: parentId },
+    })
+    // The lark SDK is inconsistent about whether it auto-unwraps `.data` —
+    // try both shapes so we don't silently lose the parent message.
+    const item = resp?.items?.[0] ?? resp?.data?.items?.[0]
+    if (!item) {
+      process.stderr.write(
+        `feishu channel: fetchReplyContext got no item for ${parentId}; resp keys=${Object.keys(resp ?? {}).join(',')}\n`,
+      )
+      return { reply_to_id: parentId }
+    }
+
+    const msgType = item.msg_type ?? 'text'
+    const rawContent = item.body?.content ?? '{}'
+    const parentText = extractText(msgType, rawContent).trim()
+    const parentAtts = describeAttachments(msgType, rawContent)
+    const parentSender = item.sender?.id ?? ''
+
+    const meta: Record<string, string> = { reply_to_id: parentId }
+    if (parentSender) meta.reply_to_user = parentSender
+
+    // Truncate quoted text to keep notifications reasonable
+    const MAX_QUOTED = 1000
+    if (parentText) {
+      meta.reply_to_text =
+        parentText.length > MAX_QUOTED
+          ? parentText.slice(0, MAX_QUOTED) + '…'
+          : parentText
+    } else if (parentAtts.count > 0) {
+      meta.reply_to_text = `(${parentAtts.descriptions.join('; ')})`
+    }
+
+    if (parentAtts.count > 0) {
+      meta.reply_to_attachments = parentAtts.descriptions.join('; ')
+    }
+
+    process.stderr.write(
+      `feishu channel: fetchReplyContext ok for ${parentId} — type=${msgType} textLen=${parentText.length} atts=${parentAtts.count}\n`,
+    )
+
+    return meta
+  } catch (err: unknown) {
+    const m = err instanceof Error ? err.message : String(err)
+    process.stderr.write(`feishu channel: fetchReplyContext failed for ${parentId}: ${m}\n`)
+    return { reply_to_id: parentId }
+  }
 }
 
 // ── Start Feishu WebSocket client ────────────────────────────────────────────
@@ -1049,6 +1384,8 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
         messageType: message.message_type ?? 'text',
         mentions: message.mentions,
         createTime: message.create_time ?? String(Date.now()),
+        parentId: message.parent_id || undefined,
+        rootId: message.root_id || undefined,
       }
 
       await handleInbound(inbound)
