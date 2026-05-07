@@ -10,6 +10,19 @@
  * No public URL required — runs entirely local.
  */
 
+// ── Redirect SDK logging from stdout to stderr ─────────────────────────────
+// Lark SDK writes [info] lines to stdout via console.log/info, which corrupts
+// the MCP JSON-RPC protocol. Redirect all console output to stderr.
+const _origLog = console.log
+const _origInfo = console.info
+const _origWarn = console.warn
+const stderrWrite = (...args: unknown[]) => {
+  process.stderr.write(args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ') + '\n')
+}
+console.log = stderrWrite
+console.info = stderrWrite
+console.warn = stderrWrite
+
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import {
@@ -433,13 +446,33 @@ function extractCardText(card: any): string {
   return lines.length > 0 ? lines.join('\n') : '(interactive card)'
 }
 
+/** Resolve the {title, content} body from either V1 (locale-keyed) or V2 (top-level) post format. */
+function resolvePostBody(post: any): { title: string; content: any[] } | null {
+  // V2 format: title and content directly at top level
+  if (Array.isArray(post.content)) {
+    return { title: post.title ?? '', content: post.content }
+  }
+  // V1 format: keyed by locale (zh_cn, en_us, ja_jp, etc.)
+  const lang = post.zh_cn ?? post.en_us ?? post.ja_jp
+    ?? Object.values(post).find((v: any) => v && typeof v === 'object' && Array.isArray(v.content))
+  if (!lang || typeof lang !== 'object') return null
+  return { title: lang.title ?? '', content: lang.content ?? [] }
+}
+
 function extractPostText(post: any): string {
   const lines: string[] = []
-  // Post content may be keyed by locale: zh_cn, en_us, ja_jp, etc.
-  const lang = post.zh_cn ?? post.en_us ?? post.ja_jp ?? Object.values(post)[0]
-  if (!lang) return ''
-  if (lang.title) lines.push(lang.title)
-  for (const paragraph of lang.content ?? []) {
+  const body = resolvePostBody(post)
+  if (!body) return ''
+  if (body.title) lines.push(body.title)
+  for (const paragraph of body.content) {
+    // code_block can appear as a direct object in content (not wrapped in array)
+    if (!Array.isArray(paragraph)) {
+      if (paragraph?.tag === 'code_block') {
+        const lang = paragraph.language ?? ''
+        lines.push(`\`\`\`${lang}\n${paragraph.text ?? ''}\n\`\`\``)
+      }
+      continue
+    }
     const parts: string[] = []
     for (const node of paragraph) {
       if (node.tag === 'text') parts.push(node.text ?? '')
@@ -447,6 +480,11 @@ function extractPostText(post: any): string {
       else if (node.tag === 'at') parts.push(`@${node.user_name ?? node.user_id ?? ''}`)
       else if (node.tag === 'img') parts.push('(image)')
       else if (node.tag === 'media') parts.push('(media)')
+      else if (node.tag === 'emotion') parts.push(node.emoji_type ?? '')
+      else if (node.tag === 'code_block') {
+        const lang = node.language ?? ''
+        parts.push(`\`\`\`${lang}\n${node.text ?? ''}\n\`\`\``)
+      } else if (node.tag === 'code') parts.push(`\`${node.text ?? ''}\``)
     }
     lines.push(parts.join(''))
   }
@@ -464,6 +502,21 @@ function stripBotMention(text: string, mentions?: InboundMessage['mentions']): s
   return text
 }
 
+/** Extract image_keys from post (rich-text) content nodes. */
+function extractPostImageKeys(post: any): string[] {
+  const keys: string[] = []
+  const body = resolvePostBody(post)
+  if (!body) return keys
+  for (const paragraph of body.content) {
+    for (const node of paragraph) {
+      if (node.tag === 'img' && node.image_key) {
+        keys.push(node.image_key)
+      }
+    }
+  }
+  return keys
+}
+
 /** Identify attachments in a message for metadata. */
 function describeAttachments(
   messageType: string,
@@ -474,6 +527,11 @@ function describeAttachments(
     switch (messageType) {
       case 'image': {
         return { count: 1, descriptions: [`image (${parsed.image_key ?? 'unknown'})`] }
+      }
+      case 'post': {
+        const keys = extractPostImageKeys(parsed)
+        if (keys.length === 0) return { count: 0, descriptions: [] }
+        return { count: keys.length, descriptions: keys.map(k => `image (${k})`) }
       }
       case 'file': {
         const name = parsed.file_name ?? 'unknown'
@@ -993,11 +1051,15 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'download_attachment',
       description:
-        'Download attachments (images, files) from a specific Feishu message to the local inbox. Returns file paths ready to Read.',
+        'Download attachments (images, files) from a specific Feishu message to the local inbox. Returns file paths ready to Read. Optionally pass image_key (from the attachments attribute in the channel block) to skip the message fetch step.',
       inputSchema: {
         type: 'object',
         properties: {
           message_id: { type: 'string' },
+          image_key: {
+            type: 'string',
+            description: 'Image key from the channel block attachments attribute (e.g. img_v3_xxx). If provided, skips re-fetching the message.',
+          },
         },
         required: ['message_id'],
       },
@@ -1178,53 +1240,76 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
       case 'download_attachment': {
         const messageId = args.message_id as string
-
-        // Fetch the message to get its content
-        const msgResp = await feishuClient.im.message.get({
-          path: { message_id: messageId },
-        })
-
-        const msgType = msgResp?.items?.[0]?.msg_type ?? ''
-        const content = msgResp?.items?.[0]?.body?.content ?? '{}'
-        const parsed = JSON.parse(content)
+        const providedImageKey = args.image_key as string | undefined
 
         const downloaded: string[] = []
         mkdirSync(INBOX_DIR, { recursive: true })
 
-        if (msgType === 'image' && parsed.image_key) {
+        if (providedImageKey) {
+          // Fast path: image_key provided directly from channel block — skip message fetch
           const resp = await feishuClient.im.messageResource.get({
-            path: { message_id: messageId, file_key: parsed.image_key },
+            path: { message_id: messageId, file_key: providedImageKey },
             params: { type: 'image' },
           })
           if (resp) {
-            const path = join(INBOX_DIR, `${Date.now()}-${parsed.image_key}.png`)
-            const buf = Buffer.from(resp as any)
-            writeFileSync(path, buf)
+            const path = join(INBOX_DIR, `${Date.now()}-${providedImageKey}.png`)
+            await (resp as any).writeFile(path)
             downloaded.push(`  ${path}  (image)`)
           }
-        } else if (msgType === 'file' && parsed.file_key) {
-          const resp = await feishuClient.im.messageResource.get({
-            path: { message_id: messageId, file_key: parsed.file_key },
-            params: { type: 'file' },
+        } else {
+          // Slow path: fetch the message to discover attachment keys
+          const msgResp = await feishuClient.im.message.get({
+            path: { message_id: messageId },
           })
-          if (resp) {
-            const name = parsed.file_name ?? `${parsed.file_key}`
-            const ext = name.includes('.') ? name.slice(name.lastIndexOf('.') + 1) : 'bin'
-            const path = join(INBOX_DIR, `${Date.now()}-${parsed.file_key}.${ext}`)
-            const buf = Buffer.from(resp as any)
-            writeFileSync(path, buf)
-            downloaded.push(`  ${path}  (${name})`)
-          }
-        } else if (msgType === 'audio' && parsed.file_key) {
-          const resp = await feishuClient.im.messageResource.get({
-            path: { message_id: messageId, file_key: parsed.file_key },
-            params: { type: 'file' },
-          })
-          if (resp) {
-            const path = join(INBOX_DIR, `${Date.now()}-${parsed.file_key}.opus`)
-            const buf = Buffer.from(resp as any)
-            writeFileSync(path, buf)
-            downloaded.push(`  ${path}  (audio)`)
+          const msgType = msgResp?.items?.[0]?.msg_type ?? ''
+          const content = msgResp?.items?.[0]?.body?.content ?? '{}'
+          const parsed = JSON.parse(content)
+
+          if (msgType === 'image' && parsed.image_key) {
+            const resp = await feishuClient.im.messageResource.get({
+              path: { message_id: messageId, file_key: parsed.image_key },
+              params: { type: 'image' },
+            })
+            if (resp) {
+              const path = join(INBOX_DIR, `${Date.now()}-${parsed.image_key}.png`)
+              await (resp as any).writeFile(path)
+              downloaded.push(`  ${path}  (image)`)
+            }
+          } else if (msgType === 'file' && parsed.file_key) {
+            const resp = await feishuClient.im.messageResource.get({
+              path: { message_id: messageId, file_key: parsed.file_key },
+              params: { type: 'file' },
+            })
+            if (resp) {
+              const name = parsed.file_name ?? `${parsed.file_key}`
+              const ext = name.includes('.') ? name.slice(name.lastIndexOf('.') + 1) : 'bin'
+              const path = join(INBOX_DIR, `${Date.now()}-${parsed.file_key}.${ext}`)
+              await (resp as any).writeFile(path)
+              downloaded.push(`  ${path}  (${name})`)
+            }
+          } else if (msgType === 'audio' && parsed.file_key) {
+            const resp = await feishuClient.im.messageResource.get({
+              path: { message_id: messageId, file_key: parsed.file_key },
+              params: { type: 'file' },
+            })
+            if (resp) {
+              const path = join(INBOX_DIR, `${Date.now()}-${parsed.file_key}.opus`)
+              await (resp as any).writeFile(path)
+              downloaded.push(`  ${path}  (audio)`)
+            }
+          } else if (msgType === 'post') {
+            const keys = extractPostImageKeys(parsed)
+            for (const key of keys) {
+              const resp = await feishuClient.im.messageResource.get({
+                path: { message_id: messageId, file_key: key },
+                params: { type: 'image' },
+              })
+              if (resp) {
+                const path = join(INBOX_DIR, `${Date.now()}-${key}.png`)
+                await (resp as any).writeFile(path)
+                downloaded.push(`  ${path}  (image)`)
+              }
+            }
           }
         }
 
