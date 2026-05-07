@@ -358,7 +358,7 @@ function extractText(messageType: string, content: string): string {
       case 'sticker':
         return '(sticker)'
       case 'interactive':
-        return '(interactive card)'
+        return extractCardText(parsed)
       case 'share_chat':
         return '(shared chat)'
       case 'share_user':
@@ -371,6 +371,66 @@ function extractText(messageType: string, content: string): string {
   } catch {
     return content
   }
+}
+
+/**
+ * Best-effort extraction of human-readable text from an interactive card.
+ * Walks header, summary, and elements (both legacy `elements` and card-2 `body.elements`).
+ * Falls back to `summary.content`, then to `(interactive card)` if nothing usable is found.
+ */
+function extractCardText(card: any): string {
+  if (!card || typeof card !== 'object') return '(interactive card)'
+
+  const lines: string[] = []
+  const seen = new Set<string>()
+  const push = (s: unknown) => {
+    if (typeof s !== 'string') return
+    const trimmed = s.trim()
+    if (!trimmed || seen.has(trimmed)) return
+    seen.add(trimmed)
+    lines.push(trimmed)
+  }
+
+  push(card?.header?.title?.content)
+  push(card?.header?.subtitle?.content)
+
+  const walk = (node: any, depth = 0): void => {
+    if (!node || depth > 12) return
+    if (Array.isArray(node)) {
+      for (const child of node) walk(child, depth + 1)
+      return
+    }
+    if (typeof node !== 'object') return
+
+    const tag = node.tag
+    if (tag === 'markdown' || tag === 'plain_text' || tag === 'lark_md') {
+      push(node.content)
+    } else if (tag === 'hr') {
+      // skip dividers
+    } else if (tag === 'div') {
+      if (node.text) walk(node.text, depth + 1)
+      if (Array.isArray(node.fields)) {
+        for (const f of node.fields) walk(f?.text, depth + 1)
+      }
+    } else if (tag === 'note' && Array.isArray(node.elements)) {
+      for (const el of node.elements) walk(el, depth + 1)
+    } else if (tag === 'action' || tag === 'button') {
+      // Buttons aren't actionable from our side; skip noisy labels.
+    } else {
+      if (node.content && typeof node.content === 'string') push(node.content)
+      if (node.text) walk(node.text, depth + 1)
+      if (Array.isArray(node.elements)) {
+        for (const el of node.elements) walk(el, depth + 1)
+      }
+    }
+  }
+
+  if (Array.isArray(card.elements)) walk(card.elements)
+  if (Array.isArray(card?.body?.elements)) walk(card.body.elements)
+
+  if (lines.length === 0) push(card?.summary?.content)
+
+  return lines.length > 0 ? lines.join('\n') : '(interactive card)'
 }
 
 function extractPostText(post: any): string {
