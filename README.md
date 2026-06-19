@@ -247,6 +247,51 @@ FEISHU_DOMAIN=https://open.larksuite.com
 **Q: Team/Enterprise 组织无法使用？**
 需要组织管理员在 Claude 管理后台启用 Channels 功能。
 
+## 🛡️ Standalone 模式 + 看门狗（可选）
+
+如果你需要在**不启动 Claude Code 会话**的情况下独立运行飞书机器人（例如配合 DeepSeek / Volces API 使用），可以使用 **Standalone 模式**。
+
+Standalone 模式是 Channel 插件的一个独立变体，去掉了 `claude/channel` 能力，改为通过 `claude --print` 子进程处理消息，因此兼容任何 Anthropic 兼容 API。
+
+### 与 Channel 插件的区别
+
+| | Channel 插件 | Standalone 模式 |
+|---|---|---|
+| **运行方式** | `claude --dangerously-load-development-channels` | `bun run feishu-standalone-server.ts` |
+| **AI 后端** | Claude Code 内置 | 通过 `claude --print` 子进程 |
+| **API 兼容** | 仅 Anthropic 官方 | DeepSeek / Volces / Anthropic 等 |
+| **进程守护** | Claude Code 管理 | 需要外部看门狗 |
+| **需要看门狗** | ❌ | ✅ |
+
+### 看门狗（Watchdog）
+
+独立运行时没有父进程兜底，服务器崩溃后消息会丢失。`watchdog/` 目录提供了一个跨平台看门狗脚本，自动监控并重启服务。
+
+```bash
+# 启动看门狗（会自动拉起并监控 Standalone 服务器）
+FEISHU_SERVER_SCRIPT=~/feishu-standalone-server.ts \
+  bash watchdog/watchdog.sh
+```
+
+**特性**：
+- 🔒 **单例守卫**：`mkdir` 原子锁，防止重复实例
+- 🔄 **自动重启**：30 秒检测周期，崩溃后自动拉起
+- 📈 **指数退避**：连续失败后等待递增（30s → 60s → ... → 300s）
+- 🪟 **跨平台**：Windows（`tasklist`）/ Linux & macOS（`kill -0`）
+- 📝 **详细日志**：`~/.claude/channels/feishu/watchdog.log`
+
+详细配置和故障排查见 [`watchdog/README.md`](watchdog/README.md)。
+
+### Windows 开机自启
+
+创建计划任务或启动项实现重启后自动运行：
+
+```bat
+@echo off
+start "FeishuWatchdog" /MIN bash -c ^
+  "FEISHU_SERVER_SCRIPT=%USERPROFILE%\.claude\feishu-standalone-server.ts bash %USERPROFILE%\path\to\watchdog\watchdog.sh"
+```
+
 ## 开发
 
 如果你想本地开发或修改此插件：
